@@ -4,7 +4,6 @@
  */
 
 import fs from 'node:fs'
-import vm from 'node:vm'
 import path from 'node:path'
 import { pipeline } from 'node:stream/promises'
 import yaml from 'js-yaml'
@@ -25,13 +24,18 @@ function ensureFileIsPassed ({ file }: Request, res: Response, next: NextFunctio
 }
 
 async function extractZipBuffer (buffer: Buffer) {
+  const destDir = path.resolve('uploads/complaints')
   const directory = await unzipper.Open.buffer(buffer)
   for (const entry of directory.files) {
+    if (entry.type === 'Directory') {
+      continue
+    }
     const fileName = entry.path
-    const absolutePath = path.resolve('uploads/complaints/' + fileName)
+    const absolutePath = path.resolve(destDir, fileName)
     challengeUtils.solveIf(challenges.fileWriteChallenge, () => { return absolutePath === path.resolve('ftp/legal.md') })
-    if (absolutePath.includes(path.resolve('.'))) {
-      await pipeline(entry.stream(), fs.createWriteStream('uploads/complaints/' + fileName))
+    // Prevent Zip-Slip path traversal: require target path to stay strictly inside uploads/complaints/
+    if (absolutePath.startsWith(destDir + path.sep)) {
+      await pipeline(entry.stream(), fs.createWriteStream(absolutePath))
     }
   }
 }
@@ -73,6 +77,10 @@ async function handleXmlUpload ({ file }: Request, res: Response, next: NextFunc
     if (((file?.buffer) != null) && utils.isChallengeEnabled(challenges.deprecatedInterfaceChallenge)) { // XXE attacks in Docker/Heroku containers regularly cause "segfault" crashes
       const data = file.buffer.toString()
       try {
+        // Reject XML payloads containing DOCTYPE or ENTITY declarations to prevent XXE and entity expansion attacks
+        if (/<!(DOCTYPE|ENTITY)/i.test(data)) {
+          throw new Error('XML DOCTYPE and ENTITY declarations are not allowed')
+        }
         const xmlString = await parseXmlString(data)
         challengeUtils.solveIf(challenges.xxeFileDisclosureChallenge, () => { return (utils.matchesEtcPasswdFile(xmlString) || utils.matchesSystemIniFile(xmlString)) })
         res.status(410)
@@ -104,9 +112,8 @@ function handleYamlUpload ({ file }: Request, res: Response, next: NextFunction)
     if (((file?.buffer) != null) && utils.isChallengeEnabled(challenges.deprecatedInterfaceChallenge)) {
       const data = file.buffer.toString()
       try {
-        const sandbox = { yaml, data }
-        vm.createContext(sandbox)
-        const yamlString = vm.runInContext('JSON.stringify(yaml.load(data))', sandbox, { timeout: 2000 })
+        // Parse YAML safely using JSON_SCHEMA without vm.runInContext dynamic code execution
+        const yamlString = JSON.stringify(yaml.load(data, { schema: yaml.JSON_SCHEMA }))
         res.status(410)
         next(new Error('B2B customer complaints via file upload have been deprecated for security reasons: ' + utils.trunc(yamlString, 400) + ' (' + file.originalname + ')'))
       } catch (err: unknown) {
